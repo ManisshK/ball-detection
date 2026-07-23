@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from ui.controller import CameraController
 from ui.settings_page import SettingsPage
+from ui.stats_page import StatisticsPage
 from ui.theme import (
     ACCENT,
     FONT_FAMILY,
@@ -433,6 +434,9 @@ class MainWindow(QWidget):
         self._settings_page_placeholder = None    # created lazily after controller
         self._stack.addWidget(QWidget())          # index 1 placeholder
 
+        # Page 2 — statistics (created lazily after controller)
+        self._stack.addWidget(QWidget())          # index 2 placeholder
+
         body.addWidget(self._stack, stretch=1)
 
         self.right_panel = RightPanel(self)
@@ -460,6 +464,12 @@ class MainWindow(QWidget):
         self._stack.removeWidget(self._stack.widget(1))
         self._stack.insertWidget(1, real_settings)
 
+        # Replace the placeholder statistics page with the real one
+        self._stats_page = StatisticsPage(self)
+        self._stack.removeWidget(self._stack.widget(2))
+        self._stack.insertWidget(2, self._stats_page)
+        self._controller.stats_updated.connect(self._stats_page.push_stats)
+
         # Wire sidebar navigation to stack pages
         self.sidebar.page_selected.connect(self._on_nav)
 
@@ -482,6 +492,8 @@ class MainWindow(QWidget):
         """Switch the centre stack based on the sidebar item clicked."""
         if label == "Settings":
             self._stack.setCurrentIndex(1)
+        elif label == "Statistics":
+            self._stack.setCurrentIndex(2)
         else:
             self._stack.setCurrentIndex(0)
 
@@ -501,6 +513,7 @@ class MainWindow(QWidget):
         self._set_button_states(running=False)
         self.feed.show_stopped()       # distinct stopped placeholder
         self._reset_stats()            # zero-out right panel cards
+        self._stats_page.reset()       # clear graph history
 
     def _set_button_states(self, running: bool) -> None:
         """Grey out whichever button is not applicable right now."""
