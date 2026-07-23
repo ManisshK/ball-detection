@@ -31,18 +31,21 @@ class BallDetector:
     Detects round balls in a single BGR frame using HSV colour masking
     and contour circularity analysis.
 
+    The HSV range used to build the mask can be overridden at runtime by
+    setting the public attributes `_hsv_lower` and `_hsv_upper` (numpy
+    uint8 arrays of shape (3,)).  When both are set, a single inclusive
+    range is used instead of the default multi-range preset.
+
     No external model weights are required; the detector runs entirely
     with OpenCV and is suitable for real-time processing.
     """
 
     def __init__(self) -> None:
         """
-        Precompute the HSV colour ranges and morphological kernel once
-        so they are reused across every detect() call.
+        Initialise default HSV colour ranges and the morphological kernel.
         """
-        # HSV ranges that cover common ball colours:
-        # red (wraps hue), orange, yellow, and white
-        self._hsv_ranges = [
+        # Default multi-band preset (used when no runtime override is set)
+        self._default_hsv_ranges = [
             # Red – lower hue band (0-10)
             (np.array([0, 80, 80]),   np.array([10, 255, 255])),
             # Red – upper hue band (160-180)
@@ -53,7 +56,24 @@ class BallDetector:
             (np.array([0, 0, 180]),   np.array([180, 40, 255])),
         ]
 
-        # 5×5 elliptical kernel for morphological noise removal
+        # Runtime-overridable single HSV range (set by CameraController each tick).
+        # None means "use the default preset above".
+        self._hsv_lower: np.ndarray | None = None
+        self._hsv_upper: np.ndarray | None = None
+
+        # Runtime-overridable confidence threshold (set by CameraController each tick)
+        self._confidence_threshold: float = CONFIDENCE_THRESHOLD
+
+        # Runtime-overridable contour shape filters
+        self._min_area: float = _MIN_AREA          # minimum contour area in px²
+        self._aspect_ratio_tolerance: float = 0.4  # max deviation from 1:1 (0–1)
+
+        # Runtime-overridable preprocessing kernel sizes
+        self._morph_kernel_size: int = 5   # odd int; used for Open + Close kernels
+        self._blur_kernel_size:  int = 5   # odd int; 0 or 1 disables Gaussian blur
+
+        # Cache the last kernel size so we only rebuild the kernel when it changes
+        self._cached_morph_k: int = 0
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
     # ------------------------------------------------------------------
@@ -90,7 +110,16 @@ class BallDetector:
 
     def _build_mask(self, hsv: np.ndarray) -> np.ndarray:
         """
-        Combine all HSV colour ranges into a single cleaned binary mask.
+        Build a cleaned binary mask from the HSV image.
+
+        Pipeline:
+            1. HSV threshold  (user-defined range or default multi-band preset)
+            2. Morphological Open  (removes isolated noise pixels)
+            3. Morphological Close (fills gaps inside blobs)
+            4. Gaussian Blur       (smooths blob edges; skipped when size < 2)
+
+        All kernel sizes are read from runtime-overridable instance attributes
+        so changes apply immediately on the next frame without restarting.
 
         Args:
             hsv: HSV image array.
@@ -98,13 +127,31 @@ class BallDetector:
         Returns:
             Binary mask (uint8, 0 or 255).
         """
+        # 1. Colour threshold
         combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in self._hsv_ranges:
-            combined = cv2.bitwise_or(combined, cv2.inRange(hsv, lo, hi))
+        if self._hsv_lower is not None and self._hsv_upper is not None:
+            combined = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
+        else:
+            for lo, hi in self._default_hsv_ranges:
+                combined = cv2.bitwise_or(combined, cv2.inRange(hsv, lo, hi))
 
-        # Morphological open removes small noise; close fills gaps inside blobs
+        # 2 & 3. Morphological Open → Close
+        # Rebuild the kernel only when the size has changed (cheap guard)
+        k = max(1, self._morph_kernel_size | 1)   # force odd, minimum 1
+        if k != self._cached_morph_k:
+            self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            self._cached_morph_k = k
+
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  self._kernel)
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, self._kernel)
+
+        # 4. Gaussian Blur (optional — skip when kernel size < 2)
+        bk = max(1, self._blur_kernel_size | 1)   # force odd
+        if bk >= 3:
+            combined = cv2.GaussianBlur(combined, (bk, bk), 0)
+            # Re-threshold to binary after blur
+            _, combined = cv2.threshold(combined, 127, 255, cv2.THRESH_BINARY)
+
         return combined
 
     def _extract_detections(
@@ -136,25 +183,38 @@ class BallDetector:
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < _MIN_AREA or area > frame_area * _MAX_AREA_RATIO:
+            # 1. Minimum area gate (runtime-configurable)
+            if area < self._min_area or area > frame_area * _MAX_AREA_RATIO:
                 continue
 
             perimeter = cv2.arcLength(contour, closed=True)
             if perimeter == 0:
                 continue
 
+            # 2. Circularity gate
             circularity = (4.0 * math.pi * area) / (perimeter ** 2)
             if circularity < _MIN_CIRCULARITY:
                 continue
+
+            # 3. Aspect-ratio gate — bounding-box w/h should be close to 1.0
+            #    tolerance=0 means exact square (perfect circle projection),
+            #    tolerance=1 means any aspect ratio is accepted.
+            x, y, w, h = cv2.boundingRect(contour)
+            if h > 0:
+                aspect = w / h
+                # deviation from 1:1; 0 = perfect, grows as shape becomes elongated
+                deviation = abs(1.0 - aspect)
+                if deviation > self._aspect_ratio_tolerance:
+                    continue
 
             # Normalised area score: small balls get lower confidence
             area_score = min(area / reference_area, 1.0)
             confidence = round(circularity * area_score, 4)
 
-            if confidence < CONFIDENCE_THRESHOLD:
+            # 4. Confidence gate
+            if confidence < self._confidence_threshold:
                 continue
 
-            x, y, w, h = cv2.boundingRect(contour)
             detections.append({
                 "bbox": [x, y, x + w, y + h],
                 "confidence": confidence,

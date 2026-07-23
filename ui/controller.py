@@ -13,6 +13,7 @@ No cv2.imshow() is used anywhere in this file.
 No backend files are modified.
 """
 
+import json
 import os
 import sys
 import time
@@ -45,6 +46,12 @@ class RuntimeConfig:
     Holds all user-configurable values that can change while the app is running.
     The pipeline reads these attributes on every frame — changes apply instantly
     for display settings, and on the next Start press for camera settings.
+
+    Persistence:
+        Settings are saved to `outputs/settings.json` automatically whenever
+        any attribute is updated.  On startup the file is loaded so the last
+        session's values are restored.  If the file does not exist the
+        hardcoded defaults are used.
     """
 
     RESOLUTIONS: dict = {
@@ -53,14 +60,93 @@ class RuntimeConfig:
         "1920×1080": (1920, 1080),
     }
 
+    # Path where settings are persisted (relative to the project root)
+    _SETTINGS_PATH: str = os.path.join("outputs", "settings.json")
+
+    # Names of attributes that are persisted (excludes class-level constants)
+    _PERSIST_KEYS: tuple = (
+        "camera_index", "frame_width", "frame_height",
+        "show_fps", "show_trajectory", "show_hsv_mask",
+        "confidence_threshold",
+        "hsv_hue_min", "hsv_hue_max",
+        "hsv_sat_min", "hsv_sat_max",
+        "hsv_val_min", "hsv_val_max",
+        "min_area", "aspect_ratio_tolerance",
+        "morph_kernel_size", "blur_kernel_size",
+        "single_ball_mode",
+    )
+
     def __init__(self) -> None:
         import config as _c
-        self.camera_index:          int   = _c.CAMERA_INDEX
-        self.frame_width:           int   = _c.FRAME_WIDTH
-        self.frame_height:          int   = _c.FRAME_HEIGHT
-        self.show_fps:              bool  = _c.SHOW_FPS
-        self.show_trajectory:       bool  = True
-        self.confidence_threshold:  float = _c.CONFIDENCE_THRESHOLD
+        # Bypass __setattr__ during construction so we don't trigger saves
+        # before all fields exist.  Use object.__setattr__ directly.
+        _set = object.__setattr__
+
+        _set(self, "camera_index",           _c.CAMERA_INDEX)
+        _set(self, "frame_width",            _c.FRAME_WIDTH)
+        _set(self, "frame_height",           _c.FRAME_HEIGHT)
+        _set(self, "show_fps",               _c.SHOW_FPS)
+        _set(self, "show_trajectory",        True)
+        _set(self, "show_hsv_mask",          False)
+        _set(self, "confidence_threshold",   _c.CONFIDENCE_THRESHOLD)
+        _set(self, "hsv_hue_min",            0)
+        _set(self, "hsv_hue_max",            180)
+        _set(self, "hsv_sat_min",            60)
+        _set(self, "hsv_sat_max",            255)
+        _set(self, "hsv_val_min",            60)
+        _set(self, "hsv_val_max",            255)
+        _set(self, "min_area",               200)
+        _set(self, "aspect_ratio_tolerance", 0.4)
+        _set(self, "morph_kernel_size",      5)
+        _set(self, "blur_kernel_size",       5)
+        _set(self, "single_ball_mode",       False)
+
+        # Load persisted values on top of defaults (silently ignored if missing)
+        self._load()
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def __setattr__(self, name: str, value) -> None:
+        """Set attribute and auto-save whenever a persisted key changes."""
+        object.__setattr__(self, name, value)
+        if name in self._PERSIST_KEYS:
+            self._save()
+
+    def _save(self) -> None:
+        """Write all persisted settings to JSON (silently ignores I/O errors)."""
+        try:
+            os.makedirs(os.path.dirname(self._SETTINGS_PATH), exist_ok=True)
+            data = {k: getattr(self, k) for k in self._PERSIST_KEYS}
+            with open(self._SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError:
+            pass  # non-fatal — run without persistence if the path is unavailable
+
+    def _load(self) -> None:
+        """
+        Load settings from JSON, applying only keys that exist in _PERSIST_KEYS.
+        Unknown keys and type errors are silently ignored so a corrupted file
+        never prevents startup.
+        """
+        if not os.path.isfile(self._SETTINGS_PATH):
+            return
+        try:
+            with open(self._SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                data: dict = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        for key in self._PERSIST_KEYS:
+            if key not in data:
+                continue
+            try:
+                # Cast to the same type as the current default to guard against
+                # a stale JSON containing a string where an int is expected.
+                current = getattr(self, key)
+                value   = type(current)(data[key])
+                object.__setattr__(self, key, value)
+            except (TypeError, ValueError):
+                pass  # keep the default if the stored value is unusable
 
 
 class CameraController(QObject):
@@ -79,6 +165,7 @@ class CameraController(QObject):
     camera_online = Signal(bool)
     error         = Signal(str)
     stats_updated = Signal(dict)   # keys: fps, detections, track_id, speed, confidence
+    mask_ready    = Signal(QPixmap)  # binary HSV mask; only emitted when show_hsv_mask=True
 
     _INTERVAL_MS: int = 33         # ~30 fps
 
@@ -217,9 +304,37 @@ class CameraController(QObject):
             self.error.emit("Camera Not Available")
             return
 
-        # 2. Detect — use live confidence threshold from RuntimeConfig
-        self._detector._confidence_threshold = self._cfg.confidence_threshold
+        # 2. Detect — push live config values into the detector before each call
+        self._detector._confidence_threshold  = self._cfg.confidence_threshold
+        self._detector._min_area              = self._cfg.min_area
+        self._detector._aspect_ratio_tolerance = self._cfg.aspect_ratio_tolerance
+        self._detector._morph_kernel_size      = self._cfg.morph_kernel_size
+        self._detector._blur_kernel_size       = self._cfg.blur_kernel_size
+        self._detector._hsv_lower = np.array([
+            self._cfg.hsv_hue_min,
+            self._cfg.hsv_sat_min,
+            self._cfg.hsv_val_min,
+        ], dtype=np.uint8)
+        self._detector._hsv_upper = np.array([
+            self._cfg.hsv_hue_max,
+            self._cfg.hsv_sat_max,
+            self._cfg.hsv_val_max,
+        ], dtype=np.uint8)
         detections = self._detector.detect(frame)
+
+        # Emit the HSV mask for debug visualisation when requested
+        if self._cfg.show_hsv_mask:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask = self._detector._build_mask(hsv)
+            # Convert single-channel mask to a 3-channel BGR image for display
+            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            self.mask_ready.emit(self._bgr_to_pixmap(mask_bgr))
+
+        # Single Ball Mode — sort by confidence desc, keep only the best one
+        if detections:
+            detections = sorted(detections, key=lambda d: d["confidence"], reverse=True)
+            if self._cfg.single_ball_mode:
+                detections = detections[:1]
 
         # 3. Track
         prev_ids = {t["id"] for t in self._tracker.get_tracks()}

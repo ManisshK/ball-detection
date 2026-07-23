@@ -405,13 +405,28 @@ class MainWindow(QWidget):
         self._stack = QStackedWidget()
         self._stack.setStyleSheet("background: transparent;")
 
-        # Page 0 — live feed
+        # Page 0 — live feed (+ optional HSV mask panel side by side)
         feed_page = QWidget()
         feed_page.setObjectName("centralWidget")
         feed_layout = QVBoxLayout(feed_page)
         feed_layout.setContentsMargins(16, 16, 16, 16)
+        feed_layout.setSpacing(10)
+
+        # Inner row: main feed | mask panel
+        feed_row = QHBoxLayout()
+        feed_row.setSpacing(12)
+
         self.feed = FeedWidget(feed_page)
-        feed_layout.addWidget(self.feed)
+        feed_row.addWidget(self.feed, stretch=2)
+
+        # HSV mask panel — hidden by default
+        self._mask_panel = FeedWidget(feed_page)
+        self._mask_panel.setVisible(False)
+        # Label it so the user knows what they're looking at
+        self._mask_panel._show_placeholder("HSV Mask", icon="🎭")
+        feed_row.addWidget(self._mask_panel, stretch=1)
+
+        feed_layout.addLayout(feed_row)
         self._stack.addWidget(feed_page)          # index 0
 
         # Page 1 — settings
@@ -432,6 +447,7 @@ class MainWindow(QWidget):
         # ── Camera controller ─────────────────────────────────────────────────
         self._controller = CameraController(self)
         self._controller.frame_ready.connect(self.feed.update_frame)
+        self._controller.mask_ready.connect(self._mask_panel.update_frame)
         self._controller.camera_online.connect(self._on_camera_online)
         self._controller.error.connect(self._on_camera_error)
         self._controller.stats_updated.connect(self._on_stats_updated)
@@ -446,6 +462,9 @@ class MainWindow(QWidget):
 
         # Wire sidebar navigation to stack pages
         self.sidebar.page_selected.connect(self._on_nav)
+
+        # Restore persisted UI state that requires the widget to exist first
+        self._mask_panel.setVisible(self._controller.config.show_hsv_mask)
 
         # Initial button state: Start enabled, Stop disabled
         self._set_button_states(running=False)
@@ -637,6 +656,12 @@ class MainWindow(QWidget):
 
     def set_camera_status(self, online: bool) -> None:
         self.sidebar.set_camera_status(online)
+
+    def set_mask_visible(self, visible: bool) -> None:
+        """Show or hide the HSV mask debug panel beside the live feed."""
+        self._mask_panel.setVisible(visible)
+        if not visible:
+            self._mask_panel._show_placeholder("HSV Mask", icon="🎭")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
