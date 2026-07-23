@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.controller import CameraController
+from ui.reports_page import ReportsPage
 from ui.settings_page import SettingsPage
 from ui.stats_page import StatisticsPage
 from ui.theme import (
@@ -437,6 +438,9 @@ class MainWindow(QWidget):
         # Page 2 — statistics (created lazily after controller)
         self._stack.addWidget(QWidget())          # index 2 placeholder
 
+        # Page 3 — reports
+        self._stack.addWidget(QWidget())          # index 3 placeholder
+
         body.addWidget(self._stack, stretch=1)
 
         self.right_panel = RightPanel(self)
@@ -470,6 +474,11 @@ class MainWindow(QWidget):
         self._stack.insertWidget(2, self._stats_page)
         self._controller.stats_updated.connect(self._stats_page.push_stats)
 
+        # Replace the placeholder reports page with the real one
+        self._reports_page = ReportsPage(self)
+        self._stack.removeWidget(self._stack.widget(3))
+        self._stack.insertWidget(3, self._reports_page)
+
         # Wire sidebar navigation to stack pages
         self.sidebar.page_selected.connect(self._on_nav)
 
@@ -494,6 +503,9 @@ class MainWindow(QWidget):
             self._stack.setCurrentIndex(1)
         elif label == "Statistics":
             self._stack.setCurrentIndex(2)
+        elif label == "Reports":
+            self._stack.setCurrentIndex(3)
+            self._reports_page.refresh()   # always show latest files on entry
         else:
             self._stack.setCurrentIndex(0)
 
