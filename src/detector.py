@@ -23,7 +23,7 @@ _MIN_AREA: float = 200.0
 # Maximum fraction of the frame area a ball may occupy
 _MAX_AREA_RATIO: float = 0.30
 # Circularity threshold: 1.0 = perfect circle; balls are typically > 0.65
-_MIN_CIRCULARITY: float = 0.65
+_MIN_CIRCULARITY: float = 0.40
 
 
 class BallDetector:

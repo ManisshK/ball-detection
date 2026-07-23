@@ -20,11 +20,19 @@ class CameraManager:
     def start(self) -> bool:
         """
         Open the webcam and configure resolution.
-
-        Returns:
-            True if the camera opened successfully, False otherwise.
         """
+
         self._cap = cv2.VideoCapture(CAMERA_INDEX)
+
+        self._cap.set(cv2.CAP_PROP_FPS, 60)
+
+        print("FPS:", self._cap.get(cv2.CAP_PROP_FPS))
+        print(
+            "Resolution:",
+            self._cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+            "x",
+            self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+        )
 
         if not self._cap.isOpened():
             self._cap = None
@@ -32,6 +40,7 @@ class CameraManager:
 
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
         return True
 
     def read(self) -> Tuple[bool, np.ndarray | None]:
