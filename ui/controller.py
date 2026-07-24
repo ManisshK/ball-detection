@@ -39,6 +39,113 @@ from trajectory import TrajectoryManager
 from visualization import Visualizer
 
 
+# ── Video recorder ────────────────────────────────────────────────────────────
+
+class VideoRecorder:
+    """
+    Wraps cv2.VideoWriter to record annotated BGR frames to disk.
+
+    Usage:
+        recorder.start(width, height, fps, output_dir)
+        recorder.write(bgr_frame)   # called each pipeline tick
+        info = recorder.stop()      # returns metadata dict
+    """
+
+    _FOURCC = cv2.VideoWriter_fourcc(*"mp4v")  # .mp4 container
+
+    def __init__(self) -> None:
+        self._writer: cv2.VideoWriter | None = None
+        self._path:   str   = ""
+        self._width:  int   = 0
+        self._height: int   = 0
+        self._fps:    float = 30.0
+        self._frames: int   = 0
+        self._start_ts: float = 0.0
+
+    @property
+    def is_recording(self) -> bool:
+        return self._writer is not None
+
+    def start(
+        self,
+        width: int,
+        height: int,
+        fps: float,
+        output_dir: str,
+    ) -> str:
+        """
+        Open a new VideoWriter.
+
+        Args:
+            width, height: Frame dimensions in pixels.
+            fps:           Target playback frame rate.
+            output_dir:    Folder to write the video into.
+
+        Returns:
+            Absolute path of the output file.
+        """
+        if self._writer is not None:
+            return self._path   # already recording
+
+        os.makedirs(output_dir, exist_ok=True)
+        stamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recording_{stamp}.mp4"
+        self._path   = os.path.abspath(os.path.join(output_dir, filename))
+        self._width  = width
+        self._height = height
+        self._fps    = max(fps, 1.0)
+        self._frames = 0
+        self._start_ts = time.time()
+
+        self._writer = cv2.VideoWriter(
+            self._path, self._FOURCC, self._fps, (self._width, self._height)
+        )
+        return self._path
+
+    def write(self, frame: np.ndarray) -> None:
+        """Write one annotated BGR frame."""
+        if self._writer is None:
+            return
+        # Resize if the frame doesn't match the writer dimensions (safety guard)
+        h, w = frame.shape[:2]
+        if w != self._width or h != self._height:
+            frame = cv2.resize(frame, (self._width, self._height))
+        self._writer.write(frame)
+        self._frames += 1
+
+    def stop(self) -> dict:
+        """
+        Finalise and release the VideoWriter.
+
+        Returns:
+            dict with keys: path, filename, duration_s, width, height,
+                            avg_fps, frame_count.
+        """
+        if self._writer is None:
+            return {}
+        self._writer.release()
+        self._writer = None
+
+        elapsed = max(time.time() - self._start_ts, 0.001)
+        info = {
+            "path":       self._path,
+            "filename":   os.path.basename(self._path),
+            "duration_s": round(elapsed, 2),
+            "width":      self._width,
+            "height":     self._height,
+            "avg_fps":    round(self._frames / elapsed, 1),
+            "frame_count": self._frames,
+        }
+        self._path = ""
+        return info
+
+    def release(self) -> None:
+        """Safe cleanup — call on application close."""
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+
+
 # ── Runtime configuration (mutable, read by the pipeline every tick) ─────────
 
 class RuntimeConfig:
@@ -188,13 +295,17 @@ class CameraController(QObject):
 
         # ── session accumulators ──────────────────────────────────────────────
         self._prev_track_ids: set  = set()
-        self._max_fps: float       = 0.0
+        self._max_fps:   float     = 0.0
+        self._max_speed: float     = 0.0
         self._tracks_created: int  = 0
 
         self._running = False
 
         # Holds the most-recent annotated QPixmap so Capture Frame can grab it
         self._last_pixmap: Optional[QPixmap] = None
+
+        # Video recorder
+        self._recorder = VideoRecorder()
 
         self._timer = QTimer(self)
         self._timer.setInterval(self._INTERVAL_MS)
@@ -211,6 +322,7 @@ class CameraController(QObject):
         self._tracker.clear()
         self._prev_track_ids  = set()
         self._max_fps         = 0.0
+        self._max_speed       = 0.0
         self._tracks_created  = 0
         self._metrics         = MetricsManager()
 
@@ -235,6 +347,7 @@ class CameraController(QObject):
         if not self._running:
             return
         self._timer.stop()
+        self._recorder.release()   # stop any active recording cleanly
         self._camera.release()
         self._running = False
         self.camera_online.emit(False)
@@ -242,6 +355,34 @@ class CameraController(QObject):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    # ── Recording API ─────────────────────────────────────────────────────────
+
+    def start_recording(self, output_dir: str = os.path.join("outputs", "videos")) -> str:
+        """
+        Begin recording annotated frames to an MP4 file.
+
+        Returns:
+            Absolute path of the output file (available immediately).
+        """
+        w = self._cfg.frame_width
+        h = self._cfg.frame_height
+        fps = self._metrics.get_metrics().get("avg_fps", 0.0)
+        fps = fps if fps >= 1.0 else 30.0
+        return self._recorder.start(w, h, fps, output_dir)
+
+    def stop_recording(self) -> dict:
+        """
+        Stop recording and finalise the file.
+
+        Returns:
+            Metadata dict from VideoRecorder.stop().
+        """
+        return self._recorder.stop()
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder.is_recording
 
     # ── Report / capture API ──────────────────────────────────────────────────
 
@@ -282,6 +423,35 @@ class CameraController(QObject):
     def last_pixmap(self) -> Optional[QPixmap]:
         """The most-recently rendered annotated frame, or None."""
         return self._last_pixmap
+
+    def get_session_summary(self) -> dict:
+        """
+        Return a snapshot of all session statistics at the moment of stopping.
+
+        Intended to be called immediately after stop() so the final metrics
+        are captured before the next session resets the counters.
+
+        Returns:
+            dict with keys:
+                runtime_s, current_fps, avg_fps, max_fps,
+                detection_count, tracks_created, lost_tracks,
+                avg_speed, max_speed,
+                json_report_path, txt_report_path.
+        """
+        m = self._metrics.get_metrics()
+        return {
+            "runtime_s":       m.get("runtime", 0.0),
+            "current_fps":     m.get("current_fps", 0.0),
+            "avg_fps":         m.get("avg_fps", 0.0),
+            "max_fps":         self._max_fps,
+            "detection_count": m.get("detection_count", 0),
+            "tracks_created":  self._tracks_created,
+            "lost_tracks":     m.get("lost_tracks", 0),
+            "avg_speed":       self._avg_speed(),
+            "max_speed":       self._max_speed,
+            "json_report_path": self.json_report_path,
+            "txt_report_path":  self.txt_report_path,
+        }
 
     def _avg_speed(self) -> float:
         """Mean speed across all currently tracked balls (px/s)."""
@@ -378,6 +548,10 @@ class CameraController(QObject):
             }
         speeds_map = {t["id"]: self._speed_est.get_speed(t["id"])
                       for t in current_tracks}
+        if speeds_map:
+            frame_max_spd = max(speeds_map.values())
+            if frame_max_spd > self._max_speed:
+                self._max_speed = frame_max_spd
         mode = "TRACKING" if current_tracks else "SEARCHING"
 
         # 7. Render overlays — use live show_fps flag from RuntimeConfig
@@ -394,6 +568,10 @@ class CameraController(QObject):
         pixmap = self._bgr_to_pixmap(annotated)
         self._last_pixmap = pixmap
         self.frame_ready.emit(pixmap)
+
+        # 8b. Write to video recorder if active
+        if self._recorder.is_recording:
+            self._recorder.write(annotated)
 
         # 9. Emit per-frame stats — read already-computed values, no duplication.
         #    MetricsManager.get_metrics() was called above (stored in `m`).
