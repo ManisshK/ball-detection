@@ -32,7 +32,10 @@ from PySide6.QtWidgets import (
 )
 
 from ui.controller import CameraController
+from ui.reports_page import ReportsPage
+from ui.session_summary import SessionSummaryDialog
 from ui.settings_page import SettingsPage
+from ui.stats_page import StatisticsPage
 from ui.theme import (
     ACCENT,
     FONT_FAMILY,
@@ -372,6 +375,31 @@ class BottomBar(QWidget):
 
         layout.addStretch()
 
+        # ── Recording controls (right-aligned) ────────────────────────────────
+        # Pulsing REC indicator — hidden until recording starts
+        self.rec_badge = QLabel("⏺  REC")
+        self.rec_badge.setFont(QFont(FONT_FAMILY, 11, QFont.Weight.Bold))
+        self.rec_badge.setStyleSheet("color: #ff3b3b; background: transparent; padding-right: 4px;")
+        self.rec_badge.setVisible(False)
+        layout.addWidget(self.rec_badge)
+
+        self.btn_start_rec = QPushButton("⏺  Start Recording")
+        self.btn_start_rec.setObjectName("actionBtn")
+        self.btn_start_rec.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_start_rec.setFixedHeight(36)
+        self.btn_start_rec.setStyleSheet(
+            "QPushButton#actionBtn { border-color: #ff3b3b; }"
+            "QPushButton#actionBtn:hover { color: #ff3b3b; border-color: #ff3b3b; }"
+        )
+        layout.addWidget(self.btn_start_rec)
+
+        self.btn_stop_rec = QPushButton("⏹  Stop Recording")
+        self.btn_stop_rec.setObjectName("actionBtn")
+        self.btn_stop_rec.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop_rec.setFixedHeight(36)
+        self.btn_stop_rec.setEnabled(False)
+        layout.addWidget(self.btn_stop_rec)
+
 
 # ── Main Window ───────────────────────────────────────────────────────────────
 
@@ -433,6 +461,12 @@ class MainWindow(QWidget):
         self._settings_page_placeholder = None    # created lazily after controller
         self._stack.addWidget(QWidget())          # index 1 placeholder
 
+        # Page 2 — statistics (created lazily after controller)
+        self._stack.addWidget(QWidget())          # index 2 placeholder
+
+        # Page 3 — reports
+        self._stack.addWidget(QWidget())          # index 3 placeholder
+
         body.addWidget(self._stack, stretch=1)
 
         self.right_panel = RightPanel(self)
@@ -460,6 +494,17 @@ class MainWindow(QWidget):
         self._stack.removeWidget(self._stack.widget(1))
         self._stack.insertWidget(1, real_settings)
 
+        # Replace the placeholder statistics page with the real one
+        self._stats_page = StatisticsPage(self)
+        self._stack.removeWidget(self._stack.widget(2))
+        self._stack.insertWidget(2, self._stats_page)
+        self._controller.stats_updated.connect(self._stats_page.push_stats)
+
+        # Replace the placeholder reports page with the real one
+        self._reports_page = ReportsPage(self)
+        self._stack.removeWidget(self._stack.widget(3))
+        self._stack.insertWidget(3, self._reports_page)
+
         # Wire sidebar navigation to stack pages
         self.sidebar.page_selected.connect(self._on_nav)
 
@@ -476,12 +521,26 @@ class MainWindow(QWidget):
         btns["TXT Report"].clicked.connect(self._open_txt_report)
         btns["Export Session"].clicked.connect(self._export_session)
 
+        # Recording buttons
+        self.bottom_bar.btn_start_rec.clicked.connect(self._start_recording)
+        self.bottom_bar.btn_stop_rec.clicked.connect(self._stop_recording)
+
+        # Blink timer for REC badge
+        self._rec_blink_timer = QTimer(self)
+        self._rec_blink_timer.setInterval(600)
+        self._rec_blink_timer.timeout.connect(self._blink_rec_badge)
+
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def _on_nav(self, label: str) -> None:
         """Switch the centre stack based on the sidebar item clicked."""
         if label == "Settings":
             self._stack.setCurrentIndex(1)
+        elif label == "Statistics":
+            self._stack.setCurrentIndex(2)
+        elif label == "Reports":
+            self._stack.setCurrentIndex(3)
+            self._reports_page.refresh()   # always show latest files on entry
         else:
             self._stack.setCurrentIndex(0)
 
@@ -496,11 +555,33 @@ class MainWindow(QWidget):
         self._controller.start()
 
     def _stop_camera(self) -> None:
-        """Stop the pipeline; leave the app running so Start can be used again."""
-        self._controller.stop()        # releases camera + stops timer
+        """Stop the pipeline and show the session summary dialog."""
+        # 1. Capture summary BEFORE stop() resets accumulators on next start
+        summary = self._controller.get_session_summary()
+
+        # 2. Auto-export reports so paths in the summary are valid
+        try:
+            self._controller.export_session()
+        except Exception:
+            pass   # non-fatal — dialog still shows without report paths
+
+        # 3. Stop pipeline
+        self._controller.stop()
         self._set_button_states(running=False)
-        self.feed.show_stopped()       # distinct stopped placeholder
-        self._reset_stats()            # zero-out right panel cards
+        self.feed.show_stopped()
+        self._reset_stats()
+        self._stats_page.reset()
+
+        # 4. Show modal summary dialog
+        dlg = SessionSummaryDialog(summary, parent=self)
+        dlg.exec()
+
+        # 5. If user clicked "Open Reports Page", navigate there
+        if dlg.open_reports_requested:
+            self._reports_page.refresh()
+            self._stack.setCurrentIndex(3)
+            # Sync the sidebar highlight to Reports
+            self.sidebar.page_selected.emit("Reports")
 
     def _set_button_states(self, running: bool) -> None:
         """Grey out whichever button is not applicable right now."""
@@ -613,8 +694,55 @@ class MainWindow(QWidget):
         except Exception as exc:
             self._alert(f"Export failed:\n{exc}")
 
-    # ── Utility helpers ───────────────────────────────────────────────────────
+    # ── Recording handlers ────────────────────────────────────────────────────
 
+    def _start_recording(self) -> None:
+        """Begin recording annotated frames to an MP4 file."""
+        if not self._controller.is_running:
+            self._alert("Start the camera before recording.")
+            return
+        if self._controller.is_recording:
+            return
+
+        path = self._controller.start_recording()
+        self.bottom_bar.btn_start_rec.setEnabled(False)
+        self.bottom_bar.btn_stop_rec.setEnabled(True)
+        self.bottom_bar.rec_badge.setVisible(True)
+        self._rec_blink_timer.start()
+        self._alert(f"Recording started:\n{path}", title="Recording", info=True)
+
+    def _stop_recording(self) -> None:
+        """Stop recording and show the save confirmation dialog."""
+        if not self._controller.is_recording:
+            return
+
+        info = self._controller.stop_recording()
+        self._rec_blink_timer.stop()
+        self.bottom_bar.rec_badge.setVisible(False)
+        self.bottom_bar.btn_start_rec.setEnabled(True)
+        self.bottom_bar.btn_stop_rec.setEnabled(False)
+
+        if not info:
+            return
+
+        mins, secs = divmod(int(info.get("duration_s", 0)), 60)
+        msg = (
+            f"Video saved:\n"
+            f"  File:       {info.get('filename', '—')}\n"
+            f"  Duration:   {mins:02d}:{secs:02d}  ({info.get('duration_s', 0):.1f} s)\n"
+            f"  Resolution: {info.get('width', 0)} × {info.get('height', 0)}\n"
+            f"  Avg FPS:    {info.get('avg_fps', 0)}\n"
+            f"  Frames:     {info.get('frame_count', 0)}\n\n"
+            f"  Path: {info.get('path', '—')}"
+        )
+        self._alert(msg, title="Recording Saved", info=True)
+
+    def _blink_rec_badge(self) -> None:
+        """Toggle REC badge visibility for a blinking effect."""
+        badge = self.bottom_bar.rec_badge
+        badge.setVisible(not badge.isVisible())
+
+    # ── Utility helpers ───────────────────────────────────────────────────────
     @staticmethod
     def _open_file(path: str) -> None:
         """Open a file with the OS default application (cross-platform)."""
@@ -641,7 +769,10 @@ class MainWindow(QWidget):
         box.exec()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        """Ensure the camera is released cleanly when the window closes."""
+        """Ensure the camera and recorder are released cleanly when the window closes."""
+        self._rec_blink_timer.stop()
+        if self._controller.is_recording:
+            self._controller.stop_recording()
         self._controller.stop()
         super().closeEvent(event)
 
